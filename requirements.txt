@@ -1,0 +1,17 @@
+python==3.12.3
+
+# WebSocket 通信
+websockets>=12.0
+
+# 计算机视觉
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# 中文字体渲染
+Pillow>=10.0.0
+
+# 目标检测
+ultralytics>=8.0.0
+
+# OCR 文字识别
+rapidocr-onnxruntime>=1.3.0
