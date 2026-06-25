@@ -1,5 +1,5 @@
 """
-识别算法.py — 机器人视觉识别主逻辑
+vision_core.py — 机器人视觉识别主逻辑
 职责：摄像头采集、人脸/物体/OCR 识别、绘制预览
 发送结果：统一调用 send.py 提供的接口，不直接操作 WebSocket 协议格式
 """
@@ -20,7 +20,7 @@ from rapidocr_onnxruntime import RapidOCR
 from send import send_face, send_object, send_ocr, send_distance
 
 # ── 模型加载 ────────────────────────────────────
-model = YOLO('yolov5n.pt')
+model      = YOLO('yolov5n.pt')
 ocr_engine = RapidOCR()
 
 # ── 日志配置 ────────────────────────────────────
@@ -31,15 +31,23 @@ logging.basicConfig(
 logger = logging.getLogger("RobotClient")
 
 # ── 连接配置 ────────────────────────────────────
-SERVER_URI = "ws://127.0.0.1:5000"
-# SERVER_URI = "ws://10.10.61.7:9002"
+SERVER_URI         = "ws://127.0.0.1:5000"
 RECONNECT_INTERVAL = 5
 HEARTBEAT_INTERVAL = 3
 
-# ── 协议控制常量（仅保留连接控制类，格式类已移至 send.py）──
+# ── 协议控制常量 ─────────────────────────────────
 MSG_TYPE_HEARTBEAT = "heartbeat"
 MSG_TYPE_START     = "vision-start-test"
 MSG_TYPE_END       = "vision-end-test"
+
+# ── 性别模型配置 ─────────────────────────────────
+BASE_DIR         = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR        = os.path.join(BASE_DIR, "convert", "models")
+GENDER_PROTO     = os.path.join(MODEL_DIR, "gender_deploy.prototxt")
+GENDER_MODEL     = os.path.join(MODEL_DIR, "gender_net.caffemodel")
+GENDER_LIST      = ["male", "female"]
+GENDER_MEAN      = (78.4263377603, 87.7689143744, 114.895847746)
+GENDER_THRESHOLD = 0.5   # 低于此置信度输出 unknown
 
 # ── 全局状态 ─────────────────────────────────────
 is_running_face_test = False
@@ -73,9 +81,9 @@ def cv2_draw_chinese(img, text, position, text_color=(0, 255, 0), bg_color=None,
         font = FONT
 
     pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    draw = ImageDraw.Draw(pil_img)
+    draw    = ImageDraw.Draw(pil_img)
 
-    bbox = draw.textbbox((0, 0), text, font=font)
+    bbox   = draw.textbbox((0, 0), text, font=font)
     text_w = bbox[2] - bbox[0] + 4
     text_h = bbox[3] - bbox[1] + 4
 
@@ -87,6 +95,54 @@ def cv2_draw_chinese(img, text, position, text_color=(0, 255, 0), bg_color=None,
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 
+# ── 性别模型加载 ──────────────────────────────────
+def load_gender_net():
+    """加载 gender_net，失败时返回 None 并打印警告"""
+    if not os.path.exists(GENDER_PROTO) or not os.path.exists(GENDER_MODEL):
+        logger.warning(
+            f"性别模型文件缺失，请确认路径:\n  {GENDER_PROTO}\n  {GENDER_MODEL}"
+        )
+        return None
+    try:
+        net = cv2.dnn.readNet(GENDER_MODEL, GENDER_PROTO)
+        logger.info("性别分类模型加载成功")
+        return net
+    except Exception as e:
+        logger.warning(f"性别模型加载失败: {e}")
+        return None
+
+
+# ── 性别预测 ──────────────────────────────────────
+def predict_gender(img_bgr, x, y, w, h, gender_net):
+    """
+    裁剪人脸区域送入 gender_net 推理
+    返回: ('male'|'female'|'unknown', confidence)
+    """
+    pad   = 20
+    ih, iw = img_bgr.shape[:2]
+    x1 = max(0, x - pad)
+    y1 = max(0, y - pad)
+    x2 = min(iw, x + w + pad)
+    y2 = min(ih, y + h + pad)
+
+    face_crop = img_bgr[y1:y2, x1:x2]
+    if face_crop.size == 0:
+        return "unknown", 0.0
+
+    try:
+        blob  = cv2.dnn.blobFromImage(face_crop, 1.0, (227, 227), GENDER_MEAN, swapRB=False)
+        gender_net.setInput(blob)
+        preds = gender_net.forward()          # shape: (1, 2) [male, female]
+        conf  = float(preds[0].max())
+        label = GENDER_LIST[preds[0].argmax()]
+        if conf < GENDER_THRESHOLD:
+            return "unknown", conf
+        return label, conf
+    except Exception as e:
+        logger.warning(f"性别推理异常: {e}")
+        return "unknown", 0.0
+
+
 # ── CV 主循环（在独立线程中运行）────────────────────
 def run_cv_logic(websocket, loop):
     global is_running_face_test, current_test_type
@@ -94,8 +150,13 @@ def run_cv_logic(websocket, loop):
     cap = cv2.VideoCapture(0)
     logger.info(f"CV 线程启动，当前模式: {current_test_type}")
 
-    target_fps    = 10
+    target_fps     = 10
     frame_duration = 1.0 / target_fps
+
+    # ── 模式 0 时才加载性别模型 ──────────────────
+    gender_net = None
+    if current_test_type == 0:
+        gender_net = load_gender_net()
 
     try:
         while is_running_face_test:
@@ -105,7 +166,7 @@ def run_cv_logic(websocket, loop):
                 time.sleep(0.1)
                 continue
 
-            # ── 模式 0：人脸识别 ──────────────────────────
+            # ── 模式 0：人脸识别 + 性别分类 ──────────
             if current_test_type == 0:
                 if not hasattr(run_cv_logic, 'face_cache'):
                     run_cv_logic.face_cache = None
@@ -118,8 +179,28 @@ def run_cv_logic(websocket, loop):
 
                 if len(faces) > 0:
                     (x, y, w, h) = faces[0]
-                    run_cv_logic.face_cache = (x, y, w, h, frame_height)
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+                    # 性别预测
+                    if gender_net is not None:
+                        gender_label, gender_conf = predict_gender(
+                            frame, x, y, w, h, gender_net
+                        )
+                    else:
+                        gender_label, gender_conf = "unknown", 0.0
+
+                    run_cv_logic.face_cache = (x, y, w, h, frame_height, gender_label, gender_conf)
+
+                    # 绘制检测框 + 性别标签
+                    box_color = (0, 255, 0)
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), box_color, 2)
+                    frame = cv2_draw_chinese(
+                        frame,
+                        f"{gender_label} {gender_conf:.2f}",
+                        (x, max(0, y - 25)),
+                        text_color=(0, 0, 0),
+                        bg_color=box_color,
+                        font=FONT
+                    )
                 else:
                     run_cv_logic.face_cache = None
 
@@ -127,11 +208,10 @@ def run_cv_logic(websocket, loop):
                 if now - run_cv_logic.face_last_send_time >= 0.2:
                     run_cv_logic.face_last_send_time = now
                     if run_cv_logic.face_cache is not None:
-                        x, y, w, h, fh = run_cv_logic.face_cache
-                        # ── 调用 send.py 接口 ──
+                        x, y, w, h, fh, gender_label, gender_conf = run_cv_logic.face_cache
                         send_face(websocket, loop, faces=[{
-                            "class_id":   "face_detected",
-                            "confidence": 0.95,
+                            "class_id":   gender_label,   # male / female / unknown
+                            "confidence": gender_conf,
                             "bbox": {
                                 "x1": x,
                                 "y1": fh - y - h,
@@ -139,8 +219,9 @@ def run_cv_logic(websocket, loop):
                                 "y2": fh - y
                             }
                         }])
+                        logger.info(f"人脸发送: class_id={gender_label}, conf={gender_conf:.2f}")
 
-            # ── 模式 1：物体识别 ──────────────────────────
+            # ── 模式 1：物体识别 ──────────────────────
             elif current_test_type == 1:
                 if not hasattr(run_cv_logic, 'obj_cache'):
                     run_cv_logic.obj_cache = []
@@ -177,10 +258,9 @@ def run_cv_logic(websocket, loop):
                 now = time.time()
                 if now - run_cv_logic.obj_last_send_time >= 0.2:
                     run_cv_logic.obj_last_send_time = now
-                    # ── 调用 send.py 接口 ──
                     send_object(websocket, loop, objects=run_cv_logic.obj_cache)
 
-            # ── 模式 2：文字识别（OCR）───────────────────
+            # ── 模式 2：文字识别（OCR）───────────────
             elif current_test_type == 2:
                 if not hasattr(run_cv_logic, 'ocr_cache'):
                     run_cv_logic.ocr_cache = []
@@ -191,7 +271,6 @@ def run_cv_logic(websocket, loop):
 
                 now = time.time()
 
-                # 每 0.5 秒推理一次
                 if now - run_cv_logic.last_ocr_time >= 0.5:
                     run_cv_logic.last_ocr_time = now
                     ocr_result, _ = ocr_engine(frame)
@@ -213,16 +292,13 @@ def run_cv_logic(websocket, loop):
                             })
                     run_cv_logic.ocr_cache = new_cache
 
-                # 每 1 秒发送一次
                 if now - run_cv_logic.last_send_time >= 1:
                     run_cv_logic.last_send_time = now
-                    # ── 调用 send.py 接口 ──
                     send_ocr(websocket, loop, texts=[
                         {"text": item['text'], "language": item['lang']}
                         for item in run_cv_logic.ocr_cache
                     ])
 
-                # 绘制 OCR 结果
                 for item in run_cv_logic.ocr_cache:
                     box_pts      = item['box']
                     text_content = item['text']
@@ -246,13 +322,11 @@ def run_cv_logic(websocket, loop):
                 cv2.putText(frame, "OCR Running...", (20, 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
-            # ── 模式 3：距离测量（预留）──────────────────
+            # ── 模式 3：距离测量（预留）──────────────
             elif current_test_type == 3:
-                # dist = calculate_distance(frame)
-                # send_distance(websocket, loop, value=dist, unit="m")
                 pass
 
-            # ── 显示与帧率控制 ──────────────────────────
+            # ── 显示与帧率控制 ──────────────────────
             cv2.imshow("Robot Camera View", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 is_running_face_test = False

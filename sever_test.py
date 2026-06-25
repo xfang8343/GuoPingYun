@@ -7,7 +7,7 @@ async def handler(websocket):
 
     await websocket.send(json.dumps({
         "type": "vision-start-test",
-        "data": {"test_type": 2}
+        "data": {"test_type": 1}
     }))
     print("已发送启动指令 (文字识别)")
 

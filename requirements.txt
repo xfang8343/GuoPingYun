@@ -1,9 +1,9 @@
-python==3.12.3
+# Python 3.12.3
 
 # WebSocket 通信
 websockets>=12.0
 
-# 计算机视觉
+# 计算机视觉（含 DNN 模块，用于性别分类）
 opencv-python>=4.8.0
 numpy>=1.24.0
 

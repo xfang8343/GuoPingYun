@@ -5,12 +5,12 @@ from PIL import Image, ImageDraw
 # =========================
 # 配置
 # =========================
-ANNOTATION_FILE = "./lfw/face_detection_export.txt"
+ANNOTATION_FILE = "./lfw/face_detection.txt"
 IMAGE_DIR = "./lfw/images"
 OUTPUT_DIR = "./face_box_test"
 
 RANDOM_SELECT = True
-SAMPLE_NUM = 55
+SAMPLE_NUM = 5
 
 CUSTOM_IMAGES = [
 
